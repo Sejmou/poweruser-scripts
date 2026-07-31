@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Launch a marimo notebook in a tmux window or session.
+
+Prompts interactively for the notebook, the mode and the tmux window name.
+Anything supplied on the command line is used as the default for its prompt,
+and ``--yes`` skips the prompts entirely.
+
+Inside tmux a new window is created in the current session; outside tmux a new
+session is created, named after the current directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import glob
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+DEFAULT_PORT = 2718
+DEFAULT_NOTEBOOK = "notebook.py"
+MODES = {"edit": "edit", "app": "run"}  # our name -> marimo subcommand
+
+EPILOG = """\
+examples:
+  marimo-tmux                       prompt for everything
+  marimo-tmux analysis.py           prefill the notebook, prompt for the rest
+  marimo-tmux analysis.py -y        no prompts, all defaults
+  marimo-tmux nb.py -m app -n demo  serve as an app in a window called "demo"
+  marimo-tmux nb.py --dry-run       show the tmux command without running it
+
+environment:
+  MARIMO_HOST   host to bind to (default: tailscale IPv4, else 127.0.0.1)
+  MARIMO_PORT   first port to try (default: 2718); the next free port is used
+
+notes:
+  Relative notebook paths resolve against the directory you run this from.
+  The tmux window starts in the notebook's own directory.
+"""
+
+
+# --------------------------------------------------------------------------- #
+# cli
+# --------------------------------------------------------------------------- #
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="marimo-tmux",
+        description=__doc__,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "notebook",
+        nargs="?",
+        help=f"notebook to open (default when prompted: {DEFAULT_NOTEBOOK})",
+    )
+    parser.add_argument(
+        "-m", "--mode",
+        choices=sorted(MODES),
+        help="edit the notebook or serve it as a read-only app (default: edit)",
+    )
+    parser.add_argument(
+        "-n", "--name",
+        metavar="WINDOW",
+        help="tmux window name (default: marimo-<notebook stem>)",
+    )
+    parser.add_argument(
+        "-s", "--session",
+        metavar="SESSION",
+        help="tmux session name when not already inside tmux "
+             "(default: the current directory's name)",
+    )
+    parser.add_argument(
+        "--host",
+        help="host to bind marimo to (default: $MARIMO_HOST, tailscale IP, "
+             "or 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        help=f"first port to try; the next free one is used "
+             f"(default: $MARIMO_PORT or {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="do not reload when the file changes on disk",
+    )
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="skip all prompts and accept the defaults",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the tmux command that would run, then exit",
+    )
+    return parser.parse_args(argv)
+
+
+# --------------------------------------------------------------------------- #
+# prompting
+# --------------------------------------------------------------------------- #
+
+def enable_path_completion() -> None:
+    """Tab-completion for filesystem paths, if readline is available."""
+    try:
+        import readline
+    except ImportError:
+        return
+
+    def complete(text: str, state: int) -> str | None:
+        stub = os.path.expanduser(text)
+        matches = sorted(
+            m + "/" if os.path.isdir(m) else m for m in glob.glob(stub + "*")
+        )
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer_delims(" \t\n")
+    readline.set_completer(complete)
+    readline.parse_and_bind("tab: complete")
+
+
+def ask(question: str, default: str) -> str:
+    answer = input(f"{question} [{default}]: ").strip()
+    return answer or default
+
+
+def ask_choice(question: str, choices: list[str], default: str) -> str:
+    rendered = "/".join(c.upper() if c == default else c for c in choices)
+    while True:
+        answer = input(f"{question} ({rendered}): ").strip().lower()
+        if not answer:
+            return default
+        hits = [c for c in choices if c.startswith(answer)]
+        if len(hits) == 1:
+            return hits[0]
+        print(f"  pick one of: {', '.join(choices)}")
+
+
+def die(message: str) -> NoReturn:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+# --------------------------------------------------------------------------- #
+# tmux
+# --------------------------------------------------------------------------- #
+
+def sanitize(name: str) -> str:
+    """tmux dislikes '.' and ':' in names; keep to alphanumerics and dashes."""
+    return re.sub(r"[^A-Za-z0-9-]+", "-", name).strip("-") or "marimo"
+
+
+def session_exists(name: str) -> bool:
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", f"={name}"],  # '=' forces an exact match
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def free_session_name(base: str) -> str:
+    name, index = base, 0
+    while session_exists(name):
+        index += 1
+        name = f"{base}-{index}"
+    return name
+
+
+# --------------------------------------------------------------------------- #
+# network
+# --------------------------------------------------------------------------- #
+
+def detect_host(override: str | None) -> str:
+    if override:
+        return override
+    if host := os.environ.get("MARIMO_HOST"):
+        return host
+    if shutil.which("tailscale"):
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"], text=True, capture_output=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.split()[0]
+    return "127.0.0.1"
+
+
+def port_is_free(host: str, port: int) -> bool:
+    def try_bind(addr: str) -> bool | None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind((addr, port))
+            return True
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return False
+            return None  # e.g. the address is not local -> inconclusive
+
+    verdict = try_bind(host)
+    if verdict is None:
+        verdict = try_bind("")  # fall back to the wildcard address
+    return bool(verdict)
+
+
+def first_free_port(host: str, start: int) -> int:
+    port = start
+    while port < 65536 and not port_is_free(host, port):
+        port += 1
+    if port > 65535:
+        die(f"no free port at or above {start}")
+    return port
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+
+def main() -> None:
+    args = parse_args()
+
+    if not shutil.which("tmux"):
+        die("tmux is not installed")
+    if not args.yes:
+        enable_path_completion()
+
+    # 1. notebook ---------------------------------------------------------- #
+    raw = args.notebook or DEFAULT_NOTEBOOK
+    if not args.yes:
+        raw = ask("Notebook", raw)
+    notebook = Path(raw).expanduser().resolve()  # relative to the current cwd
+    directory = notebook.parent
+
+    # 2. mode -------------------------------------------------------------- #
+    mode = args.mode or "edit"
+    if not args.yes and args.mode is None:
+        mode = ask_choice("Mode", sorted(MODES), mode)
+    subcommand = MODES[mode]
+
+    if not notebook.exists():
+        if subcommand == "run":
+            die(f"{notebook} does not exist -- cannot serve it as an app")
+        print(f"note: {notebook} does not exist yet, marimo will create it")
+    if not directory.is_dir():
+        die(f"{directory} is not a directory")
+
+    # 3. window name ------------------------------------------------------- #
+    window = args.name or f"marimo-{sanitize(notebook.stem)}"
+    if not args.yes and args.name is None:
+        window = ask("Window name", window)
+    window = sanitize(window)
+
+    # host, port, command -------------------------------------------------- #
+    host = detect_host(args.host)
+    port = first_free_port(
+        host, args.port or int(os.environ.get("MARIMO_PORT", DEFAULT_PORT))
+    )
+
+    marimo = ["uv", "run", "marimo", subcommand, str(notebook),
+              "--headless", "--no-token", "--host", host, "--port", str(port)]
+    if not args.no_watch:
+        marimo.append("--watch")
+    command = "exec " + shlex.join(marimo)
+
+    # launch --------------------------------------------------------------- #
+    common = ["-d", "-P", "-F", "#S:#I", "-n", window, "-c", str(directory)]
+    if os.environ.get("TMUX"):
+        session = None
+        tmux_args = ["tmux", "new-window", *common, command]
+    else:
+        session = free_session_name(sanitize(args.session or Path.cwd().name))
+        tmux_args = ["tmux", "new-session", "-s", session, *common, command]
+
+    if args.dry_run:
+        print(shlex.join(tmux_args))
+        return
+
+    target = subprocess.run(
+        tmux_args, check=True, text=True, stdout=subprocess.PIPE
+    ).stdout.strip()
+
+    hint = (
+        f"tmux attach -t {shlex.quote(session)}" if session
+        else f"tmux select-window -t {shlex.quote(target)}"
+    )
+    print(f"Marimo target: {target}")
+    print(f"URL:           http://{host}:{port}")
+    print(f"Attach with:   {hint}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+    except EOFError:
+        print()
+        sys.exit(130)
+    except subprocess.CalledProcessError as exc:
+        die(f"command failed: {shlex.join(exc.cmd)}")
